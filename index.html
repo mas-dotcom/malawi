@@ -324,8 +324,9 @@
       <button onclick="loadDemo()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>Load demo</button>
       <button class="reset" onclick="resetData()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>Reset all</button>
       <button onclick="setCompanyName()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18M5 21V7l8-4v18M19 21V11l-6-3"/></svg>Company name</button>
+      <button onclick="manualSyncNow()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><path d="M16 3h5v5"/><path d="m21 3-7.5 7.5L10 7"/></svg>Sync now</button>
       <div class="storage-note" id="backup-status">No data yet</div>
-      <div class="storage-note">Saved in this browser only.</div>
+      <div class="storage-note" id="sync-status">● Connecting…</div>
     </div>
   </aside>
 
@@ -2098,10 +2099,65 @@ function syncSectionToggleLabel(){
 }
 
 function ensureMeta(){ if(!db.meta) db.meta={lastChangeAt:0,lastBackupAt:0,changesSinceBackup:0}; if(!db.settings) db.settings={company_name:""}; if(!db.activity) db.activity=[]; }
-function persist(){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); }catch(e){ flash("Could not save to browser storage: "+e,"err"); } }
+function persist(){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); }catch(e){ flash("Could not save to browser storage: "+e,"err"); } queueServerSync(); }
 function save(){ ensureMeta(); db.meta.lastChangeAt=Date.now(); db.meta.changesSinceBackup=(db.meta.changesSinceBackup||0)+1; persist(); updateBackup();
   if(db.meta.changesSinceBackup && db.meta.changesSinceBackup%20===0) flash("20+ changes since last backup.","err"); }
 function load(){ try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw) db=JSON.parse(raw); }catch(e){} ensureMeta(); }
+
+/* ---- server sync (shared dataset via /api/data) ---- */
+let _syncTimer=null, _syncing=false, _syncQueued=false;
+function setSyncStatus(state, msg){
+  const el=document.getElementById("sync-status"); if(!el) return;
+  const colors={ok:"#39d98a",syncing:"#f0b400",err:"#e0533d",idle:"#6f93ac"};
+  el.innerHTML=`<span style="color:${colors[state]||colors.idle}">●</span> ${msg}`;
+}
+function queueServerSync(){
+  clearTimeout(_syncTimer);
+  _syncTimer=setTimeout(pushToServer, 5000);
+  setSyncStatus("syncing","Syncing…");
+}
+async function pushToServer(){
+  if(_syncing){ _syncQueued=true; return; }
+  _syncing=true;
+  try{
+    const r=await fetch("/api/data",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(db)});
+    if(!r.ok){ const t=await r.text(); throw new Error(t); }
+    setSyncStatus("ok","Synced "+new Date().toLocaleTimeString());
+  }catch(e){
+    setSyncStatus("err","Sync failed — will retry");
+    console.error("server sync failed",e);
+  }finally{
+    _syncing=false;
+    if(_syncQueued){ _syncQueued=false; setTimeout(pushToServer,3000); }
+  }
+}
+async function pullFromServer(){
+  setSyncStatus("syncing","Loading shared data…");
+  const pullStartedAt=Date.now();
+  const localChangeAtBeforePull=(db && db.meta && db.meta.lastChangeAt)||0;
+  try{
+    const r=await fetch("/api/data",{cache:"no-store"});
+    if(!r.ok){ const t=await r.text().catch(()=>String(r.status)); throw new Error(t); }
+    const remote=await r.json();
+    const editedWhilePulling=(db && db.meta && db.meta.lastChangeAt && db.meta.lastChangeAt>localChangeAtBeforePull);
+    if(editedWhilePulling){
+      setSyncStatus("ok","Kept your in-progress changes · reconciling…");
+      pushToServer(); return;
+    }
+    if(remote && typeof remote==="object" && Array.isArray(remote.containers)){
+      db=remote; ensureMeta(); persistLocalOnly();
+      setSyncStatus("ok","Loaded shared data · "+new Date().toLocaleTimeString());
+      const activeTab=document.querySelector(".side-nav button.active"); if(activeTab) render(activeTab.dataset.tab);
+    } else {
+      setSyncStatus("idle","No shared data yet — using local copy");
+    }
+  }catch(e){
+    setSyncStatus("err","Could not reach server — using local copy");
+    console.error("server load failed",e);
+  }
+}
+function persistLocalOnly(){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); }catch(e){} }
+function manualSyncNow(){ clearTimeout(_syncTimer); pushToServer(); }
 
 const today=()=>new Date().toISOString().slice(0,10);
 function ago(ts){ if(!ts) return "never"; const s=Math.floor((Date.now()-ts)/1000);
@@ -3431,6 +3487,7 @@ function dailyReport(){
 load(); addItemRow();
 ["c-date","sm-date","s-date","led-date"].forEach(id=>{ const el=$("#"+id); if(el && id!=="led-date") el.value=today(); });
 updateBackup(); loadDash(); setupCollapsibleSections(); syncSectionToggleLabel();
+pullFromServer();
 </script>
 </body>
 </html>
