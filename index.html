@@ -663,7 +663,6 @@ const Engine = (function () {
     if (target) {
       for (const c of db.containers) for (const it of c.items) if (it.product_id === p.id) it.product_id = target.id;
       for (const b of db.batches) for (const l of b.lines) if (l.product_id === p.id) l.product_id = target.id;
-      (target.aliases = target.aliases || []).push(...(p.aliases || []));
       db.products = db.products.filter(x => x.id !== p.id);
       return target;
     }
@@ -720,16 +719,7 @@ const Engine = (function () {
     const k = raw.trim().toLowerCase();
     const nk = x => String(x).trim().toLowerCase().replace(/\s+/g, " ");
     const key = nk(raw);
-    return db.products.find(x => nk(x.name) === key) ||
-      db.products.find(x => (x.aliases || []).some(a => nk(a) === key)) || null;
-  }
-  function addAlias(db, productId, alias) {
-    const p = db.products.find(x => x.id === productId);
-    if (!p) throw "Choose a product.";
-    const k = alias.trim().toLowerCase();
-    if (db.products.some(x => (x.aliases || []).some(a => a.toLowerCase() === k))) throw "Mapping already exists.";
-    (p.aliases = p.aliases || []).push(alias.trim());
-    return p;
+    return db.products.find(x => nk(x.name) === key) || null;
   }
 
   // ---- inventory
@@ -1158,8 +1148,7 @@ const Engine = (function () {
     // Resolve the product within THIS container's items (products are vendor-scoped).
     const items = c.items.filter(it => {
       const pr = productById(db, it.product_id);
-      return pr && (pr.name.toLowerCase() === pkey ||
-        (pr.aliases || []).some(a => a.toLowerCase() === pkey));
+      return pr && pr.name.toLowerCase() === pkey;
     });
     if (!items.length) throw `Product '${row.product}' is not in consignment ${cid}.`;
     const product = productById(db, items[0].product_id);
@@ -2020,7 +2009,7 @@ const Engine = (function () {
 
   return {
     emptyDb, demoDb, nextId,
-    getOrCreateVendor, getOrCreateProduct, resolveProduct, addAlias,
+    getOrCreateVendor, getOrCreateProduct, resolveProduct,
     createContainer, offloadContainer, editGrn, editContainer, deleteContainer, editItem, renameProduct, splitProduct, setClosingOverride, parseClosingOverrideCsv, applyClosingOverrides, reconciliationTotals, reconciliationBreakdown, addReconciliation, updateReconciliation, deleteReconciliation, addCharge, reverseCharge,
     landedUnitCost, baseCostPerBale, additionalPerBale,
     remainingQty, productAvailable, allocatedQty, findItem,
@@ -2105,7 +2094,8 @@ function ensureMeta(){ if(!db.meta) db.meta={lastChangeAt:0,lastBackupAt:0,chang
 function persist(){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); }catch(e){ flash("Could not save to browser storage: "+e,"err"); } queueServerSync(); }
 function save(){ ensureMeta(); db.meta.lastChangeAt=Date.now(); db.meta.changesSinceBackup=(db.meta.changesSinceBackup||0)+1; persist(); updateBackup();
   if(db.meta.changesSinceBackup && db.meta.changesSinceBackup%20===0) flash("20+ changes since last backup.","err"); }
-function load(){ try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw) db=JSON.parse(raw); }catch(e){} ensureMeta(); }
+function stripAliases(){ if(db&&Array.isArray(db.products)) db.products.forEach(p=>{ delete p.aliases; }); }
+function load(){ try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw) db=JSON.parse(raw); }catch(e){} ensureMeta(); stripAliases(); }
 
 /* ---- server sync (shared dataset via /api/data) ---- */
 let _syncTimer=null, _syncing=false, _syncQueued=false, _dirty=false;
@@ -2148,7 +2138,7 @@ async function pullFromServer(){
       pushToServer(); return;
     }
     if(remote && typeof remote==="object" && Array.isArray(remote.containers)){
-      db=remote; ensureMeta(); persistLocalOnly();
+      db=remote; ensureMeta(); stripAliases(); persistLocalOnly();
       setSyncStatus("ok","Loaded shared data · "+new Date().toLocaleTimeString());
       const activeTab=document.querySelector(".side-nav button.active"); if(activeTab) render(activeTab.dataset.tab);
     } else {
@@ -2874,7 +2864,7 @@ function previewState(batch,errors){
   if(errors&&errors.length) h+=`<p class="neg" style="margin:8px 0">${errors.length} row(s) skipped: `+errors.map(e=>`line ${e.line_number}: ${esc(e.message)}`).join("; ")+"</p>";
   if(unmapped.length){
     const opts='<option value="">Choose product…</option>'+db.products.slice().sort((x,y)=>x.name.localeCompare(y.name)).map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join("");
-    h+=`<p class="neg" style="margin:10px 0 4px">Not found in stock — map each to a product (saved for next time), then commit:</p>`;
+    h+=`<p class="neg" style="margin:10px 0 4px">Not found in stock — map each to a product for this upload, then commit:</p>`;
     for(const u of unmapped){ const eid="map-"+btoa(unescape(encodeURIComponent(u))).replace(/=/g,"");
       h+=`<div class="row" style="margin-bottom:8px"><div><input value="${esc(u)}" disabled></div>`+
         `<div><select id="${eid}">${opts}</select></div>`+
@@ -2887,12 +2877,11 @@ function previewState(batch,errors){
 }
 function mapAlias(batchId,eid,encRaw){
   const raw=decodeURIComponent(encRaw); const v=parseInt(document.getElementById(eid).value);
-  if(!v){ flash("Choose the product this maps to.","err"); return; }
-  try{ const p=Engine.addAlias(db,v,raw);
-    const batch=db.batches.find(b=>b.id===batchId);
-    batch.lines.forEach(l=>{ if(l.product_id==null){ const q=Engine.resolveProduct(db,l.raw_product_name); if(q){ l.product_id=q.id; l.resolution="resolved"; } } });
-    save(); flash(`Mapped "${raw}" → ${p.name}.`,"ok"); previewState(batch,[]);
-  }catch(e){ flash("Could not map: "+e,"err"); }
+  const p=db.products.find(x=>x.id===v);
+  if(!p){ flash("Choose the product this maps to.","err"); return; }
+  const batch=db.batches.find(b=>b.id===batchId);
+  batch.lines.forEach(l=>{ if(l.product_id==null && l.raw_product_name===raw){ l.product_id=p.id; l.resolution="resolved"; } });
+  save(); flash(`Mapped "${raw}" → ${p.name} (this upload only).`,"ok"); previewState(batch,[]);
 }
 function commitBatch(id){
   const batch=db.batches.find(b=>b.id===id);
