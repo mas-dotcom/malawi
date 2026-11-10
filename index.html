@@ -324,6 +324,7 @@
       <button onclick="loadDemo()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>Load demo</button>
       <button class="reset" onclick="resetData()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>Reset all</button>
       <button onclick="setCompanyName()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18M5 21V7l8-4v18M19 21V11l-6-3"/></svg>Company name</button>
+      <button onclick="refreshApp()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>Refresh</button>
       <button onclick="manualSyncNow()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><path d="M16 3h5v5"/><path d="m21 3-7.5 7.5L10 7"/></svg>Sync now</button>
       <div class="storage-note" id="backup-status">No data yet</div>
       <div class="storage-note" id="sync-status">● Connecting…</div>
@@ -648,7 +649,7 @@ const Engine = (function () {
     // Products are scoped per vendor: the same description under two vendors stays separate.
     let p = db.products.find(x => x.name.toLowerCase() === key &&
       (vendor_id == null ? x.vendor_id == null : x.vendor_id === vendor_id));
-    if (!p) { p = { id: nextId(db), name, vendor_id: vendor_id == null ? null : vendor_id, aliases: [] }; db.products.push(p); }
+    if (!p) { p = { id: nextId(db), name, vendor_id: vendor_id == null ? null : vendor_id }; db.products.push(p); }
     return p;
   }
   // Rename a product's description (optionally merging into another of the SAME vendor with that name).
@@ -662,7 +663,6 @@ const Engine = (function () {
     if (target) {
       for (const c of db.containers) for (const it of c.items) if (it.product_id === p.id) it.product_id = target.id;
       for (const b of db.batches) for (const l of b.lines) if (l.product_id === p.id) l.product_id = target.id;
-      (target.aliases = target.aliases || []).push(...(p.aliases || []));
       db.products = db.products.filter(x => x.id !== p.id);
       return target;
     }
@@ -717,16 +717,7 @@ const Engine = (function () {
   }
   function resolveProduct(db, raw) {
     const k = raw.trim().toLowerCase();
-    let p = db.products.find(x => x.name.toLowerCase() === k);
-    if (p) return p;
-    return db.products.find(x => (x.aliases || []).some(a => a.toLowerCase() === k)) || null;
-  }
-  function addAlias(db, productName, alias) {
-    const p = getOrCreateProduct(db, productName);
-    if (db.products.some(x => (x.aliases || []).some(a => a.toLowerCase() === alias.toLowerCase())))
-      throw "Alias already exists.";
-    (p.aliases = p.aliases || []).push(alias);
-    return p;
+    return db.products.find(x => x.name.toLowerCase() === k) || null;
   }
 
   // ---- inventory
@@ -1155,8 +1146,7 @@ const Engine = (function () {
     // Resolve the product within THIS container's items (products are vendor-scoped).
     const items = c.items.filter(it => {
       const pr = productById(db, it.product_id);
-      return pr && (pr.name.toLowerCase() === pkey ||
-        (pr.aliases || []).some(a => a.toLowerCase() === pkey));
+      return pr && pr.name.toLowerCase() === pkey;
     });
     if (!items.length) throw `Product '${row.product}' is not in consignment ${cid}.`;
     const product = productById(db, items[0].product_id);
@@ -2017,7 +2007,7 @@ const Engine = (function () {
 
   return {
     emptyDb, demoDb, nextId,
-    getOrCreateVendor, getOrCreateProduct, resolveProduct, addAlias,
+    getOrCreateVendor, getOrCreateProduct, resolveProduct,
     createContainer, offloadContainer, editGrn, editContainer, deleteContainer, editItem, renameProduct, splitProduct, setClosingOverride, parseClosingOverrideCsv, applyClosingOverrides, reconciliationTotals, reconciliationBreakdown, addReconciliation, updateReconciliation, deleteReconciliation, addCharge, reverseCharge,
     landedUnitCost, baseCostPerBale, additionalPerBale,
     remainingQty, productAvailable, allocatedQty, findItem,
@@ -2102,17 +2092,18 @@ function ensureMeta(){ if(!db.meta) db.meta={lastChangeAt:0,lastBackupAt:0,chang
 function persist(){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); }catch(e){ flash("Could not save to browser storage: "+e,"err"); } queueServerSync(); }
 function save(){ ensureMeta(); db.meta.lastChangeAt=Date.now(); db.meta.changesSinceBackup=(db.meta.changesSinceBackup||0)+1; persist(); updateBackup();
   if(db.meta.changesSinceBackup && db.meta.changesSinceBackup%20===0) flash("20+ changes since last backup.","err"); }
-function load(){ try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw) db=JSON.parse(raw); }catch(e){} ensureMeta(); }
+function stripAliases(){ if(db&&Array.isArray(db.products)) db.products.forEach(p=>{ delete p.aliases; }); }
+function load(){ try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw) db=JSON.parse(raw); }catch(e){} ensureMeta(); stripAliases(); }
 
 /* ---- server sync (shared dataset via /api/data) ---- */
-let _syncTimer=null, _syncing=false, _syncQueued=false;
+let _syncTimer=null, _syncing=false, _syncQueued=false, _dirty=false;
 function setSyncStatus(state, msg){
   const el=document.getElementById("sync-status"); if(!el) return;
   const colors={ok:"#39d98a",syncing:"#f0b400",err:"#e0533d",idle:"#6f93ac"};
   el.innerHTML=`<span style="color:${colors[state]||colors.idle}">●</span> ${msg}`;
 }
 function queueServerSync(){
-  clearTimeout(_syncTimer);
+  _dirty=true; clearTimeout(_syncTimer);
   _syncTimer=setTimeout(pushToServer, 5000);
   setSyncStatus("syncing","Syncing…");
 }
@@ -2122,7 +2113,7 @@ async function pushToServer(){
   try{
     const r=await fetch("/api/data",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(db)});
     if(!r.ok){ const t=await r.text(); throw new Error(t); }
-    setSyncStatus("ok","Synced "+new Date().toLocaleTimeString());
+    _dirty=false; setSyncStatus("ok","Synced "+new Date().toLocaleTimeString());
   }catch(e){
     setSyncStatus("err","Sync failed — will retry");
     console.error("server sync failed",e);
@@ -2145,7 +2136,7 @@ async function pullFromServer(){
       pushToServer(); return;
     }
     if(remote && typeof remote==="object" && Array.isArray(remote.containers)){
-      db=remote; ensureMeta(); persistLocalOnly();
+      db=remote; ensureMeta(); stripAliases(); persistLocalOnly();
       setSyncStatus("ok","Loaded shared data · "+new Date().toLocaleTimeString());
       const activeTab=document.querySelector(".side-nav button.active"); if(activeTab) render(activeTab.dataset.tab);
     } else {
@@ -2157,6 +2148,8 @@ async function pullFromServer(){
   }
 }
 function persistLocalOnly(){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); }catch(e){} }
+async function refreshApp(){ clearTimeout(_syncTimer); if(!_syncing) await pushToServer(); await pullFromServer(); flash("Refreshed from shared data.","ok"); }
+document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible" && !_syncing && !_dirty) pullFromServer(); });
 function manualSyncNow(){ clearTimeout(_syncTimer); pushToServer(); }
 
 const today=()=>new Date().toISOString().slice(0,10);
@@ -2867,26 +2860,11 @@ function previewState(batch,errors){
   const {unmapped,shortfalls}=computeIssues(batch);
   let h=`<div class="card"><strong>Batch #${batch.id}</strong> · ${batch.sale_date} · ${batch.row_count} rows`;
   if(errors&&errors.length) h+=`<p class="neg" style="margin:8px 0">${errors.length} row(s) skipped: `+errors.map(e=>`line ${e.line_number}: ${esc(e.message)}`).join("; ")+"</p>";
-  if(unmapped.length){
-    h+=`<p class="neg" style="margin:10px 0 4px">Unmapped products — map each to a known product, then commit:</p>`;
-    for(const u of unmapped){ const eid="map-"+btoa(unescape(encodeURIComponent(u))).replace(/=/g,"");
-      h+=`<div class="row" style="margin-bottom:8px"><div><input value="${esc(u)}" disabled></div>`+
-        `<div><input id="${eid}" placeholder="Maps to product name…"></div>`+
-        `<div style="flex:0 0 auto"><button class="btn ghost small" onclick="mapAlias(${batch.id},'${eid}','${encodeURIComponent(u)}')">Save mapping</button></div></div>`; }
-  }
+  if(unmapped.length) h+='<p class="neg" style="margin:10px 0">Product not found in stock (name must match exactly): '+unmapped.map(esc).join(", ")+"</p>";
   if(shortfalls.length) h+='<p class="neg" style="margin:10px 0">Not enough stock for: '+shortfalls.map(s=>`${esc(s.product)} (short ${s.short_by})`).join(", ")+"</p>";
   if(!unmapped.length && !shortfalls.length) h+=`<button class="btn primary" onclick="commitBatch(${batch.id})">Commit batch (run FIFO)</button>`;
-  else h+=`<p class="kpi-sub" style="margin-top:10px">Resolve the issues above, then commit.</p>`;
+  else h+=`<p class="kpi-sub" style="margin-top:10px">Fix the issues above (correct the product name in the CSV), then re-upload.</p>`;
   $("#s-preview").innerHTML=h+"</div>";
-}
-function mapAlias(batchId,eid,encRaw){
-  const raw=decodeURIComponent(encRaw); const v=document.getElementById(eid).value.trim();
-  if(!v){ flash("Enter the product this maps to.","err"); return; }
-  try{ Engine.addAlias(db,v,raw);
-    const batch=db.batches.find(b=>b.id===batchId);
-    batch.lines.forEach(l=>{ if(l.product_id==null){ const p=Engine.resolveProduct(db,l.raw_product_name); if(p){ l.product_id=p.id; l.resolution="resolved"; } } });
-    save(); flash(`Mapped "${raw}" → ${v}.`,"ok"); previewState(batch,[]);
-  }catch(e){ flash("Could not map: "+e,"err"); }
 }
 function commitBatch(id){
   const batch=db.batches.find(b=>b.id===id);
